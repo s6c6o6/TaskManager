@@ -1,6 +1,5 @@
 # Tested with: flet==0.25.2
 # Requires Python 3.9+
-# Опциональные зависимости: pip install pystray reportlab pillow
 import json
 import os
 import re
@@ -122,8 +121,6 @@ class Task:
     completed_at: str = ""
     created_at: str = ""
     estimated_minutes: int = 0
-    reminder_minutes: int = 0
-    last_reminder_triggered: str = ""
 
     def __post_init__(self):
         if not self.planned_date:
@@ -162,7 +159,6 @@ class AppSettings:
 # ==================== УТИЛИТЫ ДАТ ====================
 
 def parse_date_input(text: str) -> Optional[str]:
-    """ДДММГГГГ / ДД.ММ.ГГГГ / ДД-ММ-ГГГГ / ДД/ММ/ГГГГ → ISO."""
     if not text:
         return None
     text = text.strip()
@@ -176,6 +172,14 @@ def parse_date_input(text: str) -> Optional[str]:
     cleaned = re.sub(r'\D', '', text)
     if len(cleaned) != 8:
         return None
+    try:
+        y = int(cleaned[0:4])
+        m = int(cleaned[4:6])
+        d = int(cleaned[6:8])
+        if 1900 <= y <= 2100:
+            return date(y, m, d).isoformat()
+    except ValueError:
+        pass
     try:
         d = int(cleaned[0:2])
         mo = int(cleaned[2:4])
@@ -233,7 +237,6 @@ def _normalize_stored_dates(dates: list) -> list:
 
 
 def _normalize_planned_date(raw: str) -> str:
-    """FIX: сначала YYYYMMDD, потом DDMMYYYY, потом форматы с разделителями."""
     pd = (raw or "").strip()
     if not pd:
         return date.today().isoformat()
@@ -244,7 +247,6 @@ def _normalize_planned_date(raw: str) -> str:
         except ValueError:
             return date.today().isoformat()
     if len(pd) == 8 and pd.isdigit():
-        # Сначала YYYYMMDD (год в первых 4 цифрах)
         try:
             y = int(pd[0:4])
             m = int(pd[4:6])
@@ -253,7 +255,6 @@ def _normalize_planned_date(raw: str) -> str:
                 return date(y, m, d).isoformat()
         except ValueError:
             pass
-        # Потом DDMMYYYY
         try:
             d = int(pd[0:2])
             m = int(pd[2:4])
@@ -294,7 +295,6 @@ def get_month_range(d: date) -> Tuple[date, date]:
 # ==================== ЛОГИКА TIME-BLOCK ====================
 
 def _get_task_active_dates(task: Task, horizon_days: int = 366) -> set:
-    """FIX: единая функция определения дат действия блока."""
     dates = set()
     if task.time_block_dates:
         dates.update(task.time_block_dates)
@@ -312,7 +312,6 @@ def _get_task_active_dates(task: Task, horizon_days: int = 366) -> set:
 
 
 def block_status(task: Task, now: datetime) -> Optional[dict]:
-    """FIX: использует _get_task_active_dates для единообразия."""
     if not task.use_time_blocking or task.completed:
         return None
     if not task.time_block_start or task.time_block_duration <= 0:
@@ -342,7 +341,6 @@ def block_status(task: Task, now: datetime) -> Optional[dict]:
 
 
 def find_block_conflicts(task: Task, all_tasks: List[Task]) -> List[Task]:
-    """FIX: учитывает planned_date для блоков без расписания."""
     if not task.use_time_blocking or not task.time_block_start:
         return []
     if task.time_block_duration <= 0 or not valid_hhmm(task.time_block_start):
@@ -396,7 +394,6 @@ def parse_positive_float(text: str, default: float = 0.0) -> float:
 
 
 def parse_positive_int(text: str, default: int, max_val: int = 999999) -> int:
-    """FIX: единая валидация с верхней границей."""
     raw = (text or "").strip()
     if not raw or not raw.isdigit():
         return default
@@ -735,13 +732,12 @@ class TimerState:
 
 class BackgroundChecker:
     def __init__(self, tm, page, on_alarm_triggered, on_block_started,
-                 on_block_ended, on_reminder, stop_event: threading.Event):
+                 on_block_ended, stop_event: threading.Event):
         self.tm = tm
         self.page = page
         self.on_alarm_triggered = on_alarm_triggered
         self.on_block_started = on_block_started
         self.on_block_ended = on_block_ended
-        self.on_reminder = on_reminder
         self._thread: Optional[threading.Thread] = None
         self._stop_event = stop_event
 
@@ -780,7 +776,7 @@ class BackgroundChecker:
         current_time = now.strftime("%H:%M")
         current_date_iso = now.date().isoformat()
         current_stamp = f"{current_date_iso} {current_time}"
-        triggered_any = block_changed = ended_changed = reminder_triggered = False
+        triggered_any = block_changed = ended_changed = False
         with self.tm._tasks_lock:
             for task in self.tm.tasks:
                 if not task.use_alarm or not task.alarm_time or task.completed:
@@ -792,20 +788,6 @@ class BackgroundChecker:
                     task.last_alarm_triggered = current_stamp
                     triggered_any = True
                     self._safe_run_task(self.on_alarm_triggered, task)
-                # Напоминания
-                if task.reminder_minutes > 0 and task.planned_date == current_date_iso:
-                    reminder_stamp = f"{current_date_iso} {task_alarm_norm} {task.reminder_minutes}"
-                    if task.last_reminder_triggered != reminder_stamp:
-                        try:
-                            h, m = map(int, task_alarm_norm.split(":"))
-                            reminder_dt = datetime.combine(now.date(), datetime.min.time()).replace(
-                                hour=h, minute=m) - timedelta(minutes=task.reminder_minutes)
-                            if abs((now - reminder_dt).total_seconds()) < 90:
-                                task.last_reminder_triggered = reminder_stamp
-                                reminder_triggered = True
-                                self._safe_run_task(self.on_reminder, task, task.reminder_minutes)
-                        except ValueError:
-                            pass
             for task in self.tm.tasks:
                 status = block_status(task, now)
                 if not status or status["state"] != "active":
@@ -830,7 +812,7 @@ class BackgroundChecker:
                 task.last_block_ended_triggered = stamp
                 ended_changed = True
                 self._safe_run_task(self.on_block_ended, task)
-        if triggered_any or block_changed or ended_changed or reminder_triggered:
+        if triggered_any or block_changed or ended_changed:
             self.tm.save_tasks()
 
 
@@ -857,8 +839,6 @@ class TaskManager:
         self.last_save_ts: Optional[datetime] = None
         self.load()
         self._migrate_loaded_data()
-
-    # ---- миграция ключей JSON (пробелы) ----
 
     @staticmethod
     def _strip_keys(obj):
@@ -1161,20 +1141,6 @@ class TaskManager:
                 return True
             return False
 
-    def update_folder(self, old_name: str, new_name: str, color: str, icon: str) -> bool:
-        with self._tasks_lock:
-            for f in self.folders:
-                if f.name == old_name:
-                    f.name = new_name
-                    f.color = color
-                    f.icon = icon
-                    break
-            for t in self.tasks:
-                if t.folder == old_name:
-                    t.folder = new_name
-            self._save_tasks_locked()
-            return True
-
     def delete_folder(self, name: str):
         with self._tasks_lock:
             self.folders = [f for f in self.folders if f.name != name]
@@ -1200,7 +1166,6 @@ class TaskManager:
                 self._save_tasks_locked()
 
     def tasks_for_date(self, d: date) -> List[Task]:
-        """FIX: включает задачи с повторяющимися блоками."""
         iso = d.isoformat()
         wd = weekday_code(d)
         with self._tasks_lock:
@@ -1254,7 +1219,6 @@ class TaskManager:
         return missed
 
     def create_next_recurrence(self, task: Task) -> Optional[Task]:
-        """FIX: проверяет next_iteration_created для предотвращения дублирования."""
         if task.recurrence == "none" or task.next_iteration_created:
             return None
         current_date = safe_iso(task.planned_date) or date.today()
@@ -1291,15 +1255,13 @@ class TaskManager:
             time_block_duration=task.time_block_duration,
             time_block_days=list(task.time_block_days),
             time_block_dates=list(task.time_block_dates),
-            shopping_items=[
-                ShoppingItem(id=str(uuid.uuid4()), title=it.title, bought=False,
-                             quantity=it.quantity, price=it.price)
-                for it in task.shopping_items
-            ],
+            shopping_items=[ShoppingItem(id=str(uuid.uuid4()), title=it.title, bought=False,
+                                         quantity=it.quantity, price=it.price)
+                           for it in task.shopping_items],
             comment=task.comment,
             alarm_time=task.alarm_time,
-            subtasks=[Subtask(id=str(uuid.uuid4()), title=s.title, completed=False)
-                      for s in task.subtasks],
+            subtasks=[Subtask(id=str(uuid.uuid4()), title=sub.title, completed=False)
+                     for sub in task.subtasks],
             auto_complete_on_subtasks=task.auto_complete_on_subtasks,
             recurrence=task.recurrence,
             completed_cycles=0,
@@ -1307,7 +1269,6 @@ class TaskManager:
             next_iteration_created=False,
             created_at=datetime.now().isoformat(),
             estimated_minutes=task.estimated_minutes,
-            reminder_minutes=task.reminder_minutes,
         )
         task.next_iteration_created = True
         return new_task
@@ -1333,7 +1294,6 @@ class TaskManager:
             return streak
 
     def get_statistics(self) -> dict:
-        """FIX: использует completed_at для честной аналитики."""
         today = date.today()
         week_start, week_end = get_week_range(today)
         month_start, month_end = get_month_range(today)
@@ -1448,9 +1408,9 @@ class TaskManager:
             w.writerow(["Час", "Завершено", "Запланировано", "Активные блоки"])
             for h in range(24):
                 w.writerow([f"{h:02d}:00",
-                            stats["hourly_stats"].get(h, 0),
-                            stats["hourly_planned"].get(h, 0),
-                            stats["hourly_active"].get(h, 0)])
+                           stats["hourly_stats"].get(h, 0),
+                           stats["hourly_planned"].get(h, 0),
+                           stats["hourly_active"].get(h, 0)])
             w.writerow([])
             w.writerow(["День недели", "Выполнено"])
             for i, name in enumerate(WEEKDAY_NAMES):
@@ -2113,6 +2073,7 @@ def main(page: ft.Page):
         btn_pause.visible = timer_state.is_running
         btn_resume.visible = timer_state.paused
 
+    # Будильник / блок
     async def on_alarm_triggered(task: Task):
         if app_stop_event.is_set():
             return
@@ -2159,22 +2120,8 @@ def main(page: ft.Page):
         except Exception as e:
             logger.exception("[BLOCK END UI ERROR] %s", e)
 
-    async def on_reminder(task: Task, minutes: int):
-        if app_stop_event.is_set():
-            return
-        try:
-            if task.notification_type in ("sound", "both"):
-                threading.Thread(target=play_notification_sound,
-                                 args=(tm.settings.volume,), daemon=True).start()
-            if task.notification_type in ("popup", "both"):
-                page.open(ft.SnackBar(
-                    content=ft.Text(f"⏰ Напоминание за {minutes} мин: {task.title}"),
-                    bgcolor=ft.Colors.AMBER_700, duration=6000))
-        except Exception as e:
-            logger.exception("[REMINDER UI ERROR] %s", e)
-
     bg_checker = BackgroundChecker(tm, page, on_alarm_triggered, on_block_started,
-                                    on_block_ended, on_reminder, app_stop_event)
+                                    on_block_ended, app_stop_event)
     bg_checker.start()
 
     _missed = tm.check_missed_alarms_on_startup()
@@ -2350,7 +2297,6 @@ def main(page: ft.Page):
             task = tm.by_id(src_id)
             if task is None:
                 return
-            # FIX: проверяем, не дублируется ли задача через time_block
             if task.use_time_blocking:
                 active_dates = _get_task_active_dates(task, horizon_days=1)
                 if target_date.isoformat() in active_dates:
@@ -2670,7 +2616,6 @@ def main(page: ft.Page):
                 shopping_items=[ShoppingItem(id=str(uuid.uuid4()), title=s, bought=False)
                                 for s in tpl.get("shopping_items", [])],
                 estimated_minutes=tpl.get("estimated_minutes", 0),
-                reminder_minutes=tpl.get("reminder_minutes", 0),
             )
             tm.add(new_task)
             close_dlg()
@@ -2704,11 +2649,6 @@ def main(page: ft.Page):
             alarm_f = ft.TextField(label="Будильник (ЧЧ:ММ)", width=170)
             est_f = ft.TextField(label="Оценка времени (мин)", width=170,
                                  keyboard_type=ft.KeyboardType.NUMBER)
-            reminder_f = ft.Dropdown(label="Напоминание за", width=170, value="0",
-                                     options=[ft.dropdown.Option("0", "Нет"),
-                                              ft.dropdown.Option("5", "5 мин"),
-                                              ft.dropdown.Option("15", "15 мин"),
-                                              ft.dropdown.Option("30", "30 мин")])
             day_boxes = {c: ft.Checkbox(label=ru) for c, ru in DAYS}
             subs_f = ft.TextField(label="Подзадачи (через запятую)", width=420)
             items_f = ft.TextField(label="Товары (через запятую)", width=420)
@@ -2732,7 +2672,6 @@ def main(page: ft.Page):
                     "time_block_days": [c for c, cb in day_boxes.items() if cb.value] if sw_block.value else [],
                     "alarm_time": normalize_hhmm(alarm_f.value) if sw_alarm.value else "",
                     "estimated_minutes": parse_positive_int(est_f.value, 0, 9999),
-                    "reminder_minutes": int(reminder_f.value or 0),
                     "subtasks": [s.strip() for s in (subs_f.value or "").split(",") if s.strip()],
                     "shopping_items": [s.strip() for s in (items_f.value or "").split(",") if s.strip()],
                 }
@@ -2756,7 +2695,7 @@ def main(page: ft.Page):
                     sw_shop, sw_carry, sw_block, sw_pomo, sw_timer, sw_alarm,
                     ft.Row([tb_start, tb_dur], spacing=8, wrap=True),
                     ft.Row([day_boxes[c] for c, _ in DAYS], spacing=6, wrap=True),
-                    alarm_f, est_f, reminder_f, subs_f, items_f, err,
+                    alarm_f, est_f, subs_f, items_f, err,
                 ], spacing=8, scroll=ft.ScrollMode.AUTO)),
                 actions=[ft.TextButton("Отмена", on_click=cancel),
                          ft.ElevatedButton("Сохранить", icon=ft.Icons.SAVE, on_click=do_save)],
@@ -2829,12 +2768,6 @@ def main(page: ft.Page):
         est_field = ft.TextField(label="Оценка времени (мин)", width=150,
                                  value=str(task.estimated_minutes) if task and task.estimated_minutes else "",
                                  keyboard_type=ft.KeyboardType.NUMBER, hint_text="0 = не оценивать")
-        reminder_dd = ft.Dropdown(label="Напоминание за", width=150,
-                                  value=str(task.reminder_minutes) if task else "0",
-                                  options=[ft.dropdown.Option("0", "Нет"),
-                                           ft.dropdown.Option("5", "5 мин"),
-                                           ft.dropdown.Option("15", "15 мин"),
-                                           ft.dropdown.Option("30", "30 мин")])
 
         sw_shopping = ft.Switch(label="Список покупок", value=task.is_shopping_list if task else False)
         sw_carry = ft.Switch(label="Переносить на завтра", value=task.move_to_tomorrow if task else False)
@@ -2963,13 +2896,12 @@ def main(page: ft.Page):
                 pass
         new_subtask_field.on_submit = add_subtask
 
-        sw_auto_complete = ft.Switch(
-            label="Автозавершение задачи при выполнении всех подзадач",
-            value=task.auto_complete_on_subtasks if task else False)
+        sw_auto_complete = ft.Switch(label="Автозавершение задачи при выполнении всех подзадач",
+                                     value=task.auto_complete_on_subtasks if task else False)
 
         subtasks_block = ft.Container(
             visible=bool(task and task.subtasks), padding=10, border_radius=6,
-            bgcolor=pal(ft.Colors.TEAL_50, ft.Colors.TEAL_900),
+            bgcolor=pal(ft.Colors.TEAL_50, ft.Colors.with_opacity(0.15, ft.Colors.TEAL)),
             content=ft.Column([
                 ft.Text("📋 Подзадачи:", size=12, weight=ft.FontWeight.BOLD,
                         color=pal(ft.Colors.TEAL_700, ft.Colors.TEAL_200)),
@@ -2979,8 +2911,7 @@ def main(page: ft.Page):
                                       on_click=add_subtask, tooltip="Добавить")]),
                 sw_auto_complete,
             ], spacing=6))
-        sw_subtasks = ft.Switch(label="Подзадачи (чек-лист)",
-                                value=bool(task and task.subtasks))
+        sw_subtasks = ft.Switch(label="Подзадачи (чек-лист)", value=bool(task and task.subtasks))
 
         def toggle_subtasks(e):
             subtasks_block.visible = bool(sw_subtasks.value)
@@ -2990,7 +2921,7 @@ def main(page: ft.Page):
                 pass
         sw_subtasks.on_change = toggle_subtasks
 
-        # Таймеры
+        # Таймеры — смягчённые цвета для тёмной темы
         tf_pomo_work = ft.TextField(label="Работа, мин", width=100,
                                     value=str(tm.settings.pomodoro_work),
                                     keyboard_type=ft.KeyboardType.NUMBER)
@@ -3007,7 +2938,9 @@ def main(page: ft.Page):
         sw_pomo_auto = ft.Switch(label="Автопереход", value=tm.settings.auto_continue)
         pomodoro_settings_block = ft.Container(
             visible=task.use_pomodoro if task else False, padding=10,
-            bgcolor=pal(ft.Colors.RED_50, ft.Colors.RED_900), border_radius=6,
+            bgcolor=pal(ft.Colors.RED_50, ft.Colors.with_opacity(0.15, ft.Colors.RED)),
+            border=ft.border.all(1, pal(ft.Colors.RED_200, ft.Colors.with_opacity(0.3, ft.Colors.RED))),
+            border_radius=6,
             content=ft.Column([
                 ft.Text("🍅 Настройки Pomodoro:", size=12, weight=ft.FontWeight.BOLD,
                         color=pal(ft.Colors.RED_700, ft.Colors.RED_200)),
@@ -3020,19 +2953,23 @@ def main(page: ft.Page):
                                   keyboard_type=ft.KeyboardType.NUMBER)
         timer_settings_block = ft.Container(
             visible=task.use_timer if task else False, padding=10,
-            bgcolor=pal(ft.Colors.PURPLE_50, ft.Colors.PURPLE_900), border_radius=6,
+            bgcolor=pal(ft.Colors.PURPLE_50, ft.Colors.with_opacity(0.15, ft.Colors.PURPLE)),
+            border=ft.border.all(1, pal(ft.Colors.PURPLE_200, ft.Colors.with_opacity(0.3, ft.Colors.PURPLE))),
+            border_radius=6,
             content=ft.Column([
                 ft.Text("⏳ Настройки обычного таймера:", size=12, weight=ft.FontWeight.BOLD,
                         color=pal(ft.Colors.PURPLE_700, ft.Colors.PURPLE_200)),
                 tf_regular,
             ], spacing=6))
         initial_alarm = normalize_hhmm(task.alarm_time) if task and task.alarm_time else ""
+        # FIX: смягчённые цвета будильника для тёмной темы
         alarm_time_field = ft.TextField(label="Время будильника (ЧЧ:ММ)", width=200,
                                         value=initial_alarm, hint_text="Например: 09:30",
                                         bgcolor=pal(ft.Colors.WHITE, ft.Colors.GREY_800),
                                         color=pal(ft.Colors.BLACK, ft.Colors.WHITE))
+        # FIX: hint-текст теперь адаптивный
         alarm_hint = ft.Text(f"Текущее время: {datetime.now().strftime('%H:%M')}",
-                             size=11, color=ft.Colors.GREY_600, italic=True)
+                             size=11, color=pal(ft.Colors.GREY_600, ft.Colors.GREY_400), italic=True)
 
         def on_alarm_time_blur(e):
             val = normalize_hhmm(alarm_time_field.value)
@@ -3044,12 +2981,15 @@ def main(page: ft.Page):
                     pass
         alarm_time_field.on_blur = on_alarm_time_blur
 
+        # FIX: смягчённый фон и текст для блока будильника
         alarm_settings_block = ft.Container(
             visible=task.use_alarm if task else False, padding=10,
-            bgcolor=pal(ft.Colors.ORANGE_50, ft.Colors.ORANGE_900), border_radius=6,
+            bgcolor=pal(ft.Colors.ORANGE_50, ft.Colors.with_opacity(0.12, ft.Colors.ORANGE)),
+            border=ft.border.all(1, pal(ft.Colors.ORANGE_200, ft.Colors.with_opacity(0.3, ft.Colors.ORANGE))),
+            border_radius=6,
             content=ft.Column([
                 ft.Text("⏰ Настройки будильника:", size=12, weight=ft.FontWeight.BOLD,
-                        color=pal(ft.Colors.ORANGE_700, ft.Colors.ORANGE_200)),
+                        color=pal(ft.Colors.ORANGE_700, ft.Colors.ORANGE_300)),
                 ft.Row([alarm_time_field, alarm_hint], spacing=10),
             ], spacing=6))
 
@@ -3219,17 +3159,12 @@ def main(page: ft.Page):
                 dates_raw = (time_block_dates_field.value or "").strip()
                 parsed_dates, invalid_dates = parse_dates_multi(dates_raw)
                 if invalid_dates:
-                    time_block_dates_field.error_text = (
-                        "Неверные даты: " + ", ".join(invalid_dates[:3]))
-                if not (tb_time.error_text or tb_duration.error_text
-                        or time_block_dates_field.error_text):
+                    time_block_dates_field.error_text = "Неверные даты: " + ", ".join(invalid_dates[:3])
+                if not (tb_time.error_text or tb_duration.error_text or time_block_dates_field.error_text):
                     probe = Task(
-                        id=task.id if task else "__probe__",
-                        title="probe", folder="probe",
-                        planned_date=planned_iso,
-                        use_time_blocking=True,
-                        time_block_start=start,
-                        time_block_duration=duration,
+                        id=task.id if task else "__probe__", title="probe", folder="probe",
+                        planned_date=planned_iso, use_time_blocking=True,
+                        time_block_start=start, time_block_duration=duration,
                         time_block_days=[c for c, cb in day_boxes.items() if cb.value],
                         time_block_dates=parsed_dates)
                     conflicts = find_block_conflicts(probe, tm.tasks)
@@ -3261,7 +3196,6 @@ def main(page: ft.Page):
             days = [c for c, cb in day_boxes.items() if cb.value] if sw_block.value else []
             dates = parsed_dates if sw_block.value else []
 
-            # FIX: единая валидация настроек
             if sw_pomodoro.value:
                 tm.settings.pomodoro_work = parse_positive_int(tf_pomo_work.value, 25, 999)
                 tm.settings.pomodoro_break = parse_positive_int(tf_pomo_break.value, 5, 999)
@@ -3283,7 +3217,6 @@ def main(page: ft.Page):
                                  for s in subtasks_data]
 
             est_minutes = parse_positive_int(est_field.value, 0, 9999)
-            reminder_min = int(reminder_dd.value or 0)
 
             data = dict(
                 title=title,
@@ -3305,7 +3238,6 @@ def main(page: ft.Page):
                 subtasks=subtasks_list,
                 auto_complete_on_subtasks=sw_auto_complete.value if sw_subtasks.value else False,
                 estimated_minutes=est_minutes,
-                reminder_minutes=reminder_min,
             )
 
             if task:
@@ -3336,7 +3268,7 @@ def main(page: ft.Page):
                         color=pal(ft.Colors.BLUE_700, ft.Colors.BLUE_200)),
                 title_field,
                 ft.Row([folder_dd, date_field, recurrence_dd], spacing=10, wrap=True),
-                ft.Row([est_field, reminder_dd], spacing=10),
+                ft.Row([est_field], spacing=10),
                 ft.Divider(),
                 ft.Text("Параметры задачи", weight=ft.FontWeight.BOLD, size=14,
                         color=pal(ft.Colors.BLUE_700, ft.Colors.BLUE_200)),
@@ -3376,8 +3308,8 @@ def main(page: ft.Page):
                        ft.Text(f"Будильник: {task.alarm_time}", size=13, color=ft.Colors.ORANGE_700)], spacing=4)]
               if task.use_alarm and task.alarm_time else []),
             *([ft.Row([ft.Icon(ft.Icons.REPEAT, size=16, color=ft.Colors.PURPLE_700),
-                       ft.Text(f"Повторение: {RECURRENCE_RU.get(task.recurrence)}",
-                               size=13, color=ft.Colors.PURPLE_700)], spacing=4)]
+                       ft.Text(f"Повторение: {RECURRENCE_RU.get(task.recurrence)}", size=13,
+                               color=ft.Colors.PURPLE_700)], spacing=4)]
               if task.recurrence != "none" else []),
             *([ft.Row([ft.Icon(ft.Icons.ACCESS_TIME, size=16, color=ft.Colors.RED_600),
                        ft.Text(f"Завершено циклов: {task.completed_cycles}", size=13,
@@ -3402,10 +3334,6 @@ def main(page: ft.Page):
                        ft.Text(f"Оценка: {task.estimated_minutes} мин", size=13,
                                color=ft.Colors.BLUE_700)], spacing=4)]
               if task.estimated_minutes > 0 else []),
-            *([ft.Row([ft.Icon(ft.Icons.NOTIFICATIONS, size=16, color=ft.Colors.AMBER_700),
-                       ft.Text(f"Напоминание за {task.reminder_minutes} мин", size=13,
-                               color=ft.Colors.AMBER_700)], spacing=4)]
-              if task.reminder_minutes > 0 else []),
         ], spacing=4)
 
         # Подзадачи в карточке
@@ -3792,7 +3720,6 @@ def main(page: ft.Page):
                     err.value = "Расписание: формат ЧЧ:ММ"
                     page.update()
                     return
-
             s.pomodoro_work = new_work
             s.pomodoro_break = new_break
             s.pomodoro_long_break = new_long
@@ -3867,7 +3794,7 @@ def main(page: ft.Page):
         page.open(dlg)
         page.update()
 
-    # Папки
+    # Папки — без редактирования
     folders_view = ft.Column(spacing=2, scroll=ft.ScrollMode.AUTO, expand=True)
     new_folder_field = ft.TextField(label="Новая папка", dense=True)
 
@@ -3886,56 +3813,6 @@ def main(page: ft.Page):
             select_folder(name)
         else:
             toast("Папка с таким именем уже есть", error=True)
-
-    def edit_folder_dialog(folder: FolderInfo):
-        name_f = ft.TextField(label="Название", value=folder.name, width=300)
-        color_dd = ft.Dropdown(label="Цвет", width=200, value=folder.color,
-                               options=[ft.dropdown.Option(c, ft.Text("●", color=c))
-                                        for c in FOLDER_COLORS])
-        icon_dd = ft.Dropdown(label="Иконка", width=200, value=folder.icon,
-                              options=[ft.dropdown.Option(i, ft.Icon(i)) for i in FOLDER_ICONS])
-        err = ft.Text("", color=ft.Colors.RED, size=12)
-
-        def do_save(e):
-            new_name = (name_f.value or "").strip()
-            if not new_name or new_name == "Все":
-                err.value = "Некорректное имя"
-                page.update()
-                return
-            if not tm.update_folder(folder.name, new_name, color_dd.value, icon_dd.value):
-                err.value = "Ошибка обновления"
-                page.update()
-                return
-            unregister_dialog()
-            page.close(dlg)
-            page.update()
-            if current_folder == folder.name:
-                select_folder(new_name)
-            else:
-                render_folders()
-                render_tasks()
-
-        def close():
-            unregister_dialog()
-            page.close(dlg)
-            page.update()
-
-        dlg = ft.AlertDialog(
-            modal=True, title=ft.Text("Редактировать папку"),
-            content=ft.Container(width=400, content=ft.Column([name_f, color_dd, icon_dd, err], spacing=8)),
-            actions=[ft.TextButton("Сохранить", on_click=do_save),
-                     ft.TextButton("Отмена", on_click=lambda e: close())],
-            actions_alignment=ft.MainAxisAlignment.END)
-        register_dialog(dlg, do_save)
-        page.open(dlg)
-        page.update()
-
-    def rename_folder_dialog(name: str):
-        folder = tm.get_folder_info(name)
-        if folder:
-            edit_folder_dialog(folder)
-        else:
-            toast("Папка не найдена", error=True)
 
     def delete_folder_dialog(name: str):
         count = sum(1 for t in tm.tasks if t.folder == name)
@@ -3969,8 +3846,6 @@ def main(page: ft.Page):
         controls = []
         for folder in tm.folders:
             trailing = ft.Row([
-                ft.IconButton(ft.Icons.EDIT, icon_size=16, tooltip="Редактировать",
-                              on_click=lambda e, f=folder: edit_folder_dialog(f)),
                 ft.IconButton(ft.Icons.DELETE, icon_size=16, tooltip="Удалить",
                               icon_color=ft.Colors.RED_400,
                               on_click=lambda e, n=folder.name: delete_folder_dialog(n)),
@@ -3993,7 +3868,6 @@ def main(page: ft.Page):
     save_status = ft.Text("", size=12, color=ft.Colors.GREY_500)
 
     def maybe_autocomplete(task: Task):
-        """FIX: проверяет next_iteration_created."""
         if not task.auto_complete_on_subtasks or not task.subtasks:
             return
         if all(s.completed for s in task.subtasks) and not task.completed:
@@ -4145,7 +4019,7 @@ def main(page: ft.Page):
             for flag, icon, color in (
                     (t.move_to_tomorrow and not is_carried, ft.Icons.ARROW_FORWARD, ft.Colors.ORANGE),
                     (t.use_time_blocking, ft.Icons.CALENDAR_TODAY, ft.Colors.GREEN),
-                    (t.use_pomodoro, ft.Icons.ACCESS_TIME, ft.Colors.RED),  # FIX: ACCESS_TIME
+                    (t.use_pomodoro, ft.Icons.ACCESS_TIME, ft.Colors.RED),
                     (t.use_timer, ft.Icons.HOURGLASS_EMPTY, ft.Colors.PURPLE),
                     (t.use_alarm, ft.Icons.ALARM, ft.Colors.ORANGE_700)):
                 if flag:
@@ -4226,7 +4100,9 @@ def main(page: ft.Page):
                                                     color=ft.Colors.GREY_500, italic=True))
                 shopping_section = ft.Container(
                     padding=ft.padding.only(left=10, top=5, bottom=5),
-                    bgcolor=pal(ft.Colors.AMBER_50, ft.Colors.AMBER_900), border_radius=8,
+                    bgcolor=pal(ft.Colors.AMBER_50, ft.Colors.with_opacity(0.15, ft.Colors.AMBER)),
+                    border=ft.border.all(1, pal(ft.Colors.AMBER_200, ft.Colors.with_opacity(0.3, ft.Colors.AMBER))),
+                    border_radius=8,
                     content=ft.Column([
                         ft.Row([counter_text,
                                  ft.Row([ft.IconButton(ft.Icons.ADD_CIRCLE_OUTLINE, icon_size=18,
@@ -4264,14 +4140,12 @@ def main(page: ft.Page):
                                   on_click=lambda e, task=t: open_task_card(task)),
                     ft.IconButton(ft.Icons.HOURGLASS_EMPTY,
                                   tooltip=f"Обычный таймер ({tm.settings.regular_timer_minutes} мин)",
-                                  icon_color=(ft.Colors.GREEN if is_this and timer_state.type == "regular"
-                                              else ft.Colors.GREY_700),
+                                  icon_color=ft.Colors.GREEN if is_this and timer_state.type == "regular" else ft.Colors.GREY_700,
                                   disabled=busy,
                                   on_click=lambda e, task=t: start_timer(task, "regular")),
-                    ft.IconButton(ft.Icons.ACCESS_TIME,  # FIX: ACCESS_TIME
+                    ft.IconButton(ft.Icons.ACCESS_TIME,
                                   tooltip=f"Pomodoro ({tm.settings.pomodoro_work} мин)",
-                                  icon_color=(ft.Colors.RED if is_this and timer_state.type == "pomodoro"
-                                              else ft.Colors.GREY_700),
+                                  icon_color=ft.Colors.RED if is_this and timer_state.type == "pomodoro" else ft.Colors.GREY_700,
                                   disabled=busy,
                                   on_click=lambda e, task=t: start_timer(task, "pomodoro")),
                     ft.IconButton(ft.Icons.EDIT, tooltip="Изменить",
@@ -4306,43 +4180,39 @@ def main(page: ft.Page):
                       ], spacing=8)),
         ft.Container(expand=True, padding=10,
                       content=ft.Column([
-                          ft.Row([
-                              header,
-                              save_status,
-                              ft.ElevatedButton("Все", icon=ft.Icons.LIST,
-                                                on_click=lambda e: set_view("all")),
-                              ft.ElevatedButton("Задачи", icon=ft.Icons.CHECKLIST,
-                                                on_click=lambda e: set_view("tasks")),
-                              ft.ElevatedButton("Покупки", icon=ft.Icons.SHOPPING_CART,
-                                                on_click=lambda e: set_view("shopping")),
-                              ft.Container(width=1, height=24, bgcolor=ft.Colors.GREY_400,
-                                           margin=ft.margin.symmetric(horizontal=4)),
-                              ft.IconButton(ft.Icons.HOURGLASS_EMPTY,
-                                            tooltip=f"Таймер ({tm.settings.regular_timer_minutes} мин)",
-                                            icon_color=ft.Colors.GREEN,
-                                            on_click=lambda e: start_standalone_timer("regular")),
-                              ft.IconButton(ft.Icons.ACCESS_TIME,  # FIX: ACCESS_TIME
-                                            tooltip=f"Pomodoro ({tm.settings.pomodoro_work} мин)",
-                                            icon_color=ft.Colors.RED,
-                                            on_click=lambda e: start_standalone_timer("pomodoro")),
-                              ft.Container(width=1, height=24, bgcolor=ft.Colors.GREY_400,
-                                           margin=ft.margin.symmetric(horizontal=4)),
-                              ft.IconButton(ft.Icons.CALENDAR_MONTH, tooltip="Календарь",
-                                            on_click=lambda e: show_calendar()),
-                              ft.IconButton(ft.Icons.SHOW_CHART, tooltip="Статистика",
-                                            on_click=lambda e: show_dashboard()),
-                              ft.IconButton(ft.Icons.NOTE_ALT, tooltip="Шаблоны",  # FIX: NOTE_ALT
-                                            on_click=lambda e: show_templates()),
-                              ft.IconButton(ft.Icons.SETTINGS, tooltip="Настройки",
-                                            on_click=show_settings),
-                              ft.ElevatedButton("Добавить задачу", icon=ft.Icons.ADD,
-                                                on_click=lambda e: open_editor()),
-                          ], spacing=4, wrap=True,
-                             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                             vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                          standalone_timers_view,
-                          timer_banner,
-                          tasks_view,
+                          ft.Row([header, save_status,
+                                   ft.ElevatedButton("Все", icon=ft.Icons.LIST,
+                                                      on_click=lambda e: set_view("all")),
+                                   ft.ElevatedButton("Задачи", icon=ft.Icons.CHECKLIST,
+                                                      on_click=lambda e: set_view("tasks")),
+                                   ft.ElevatedButton("Покупки", icon=ft.Icons.SHOPPING_CART,
+                                                      on_click=lambda e: set_view("shopping")),
+                                   ft.Container(width=1, height=24, bgcolor=ft.Colors.GREY_400,
+                                                 margin=ft.margin.symmetric(horizontal=4)),
+                                   ft.IconButton(ft.Icons.HOURGLASS_EMPTY,
+                                                  tooltip=f"Таймер ({tm.settings.regular_timer_minutes} мин)",
+                                                  icon_color=ft.Colors.GREEN,
+                                                  on_click=lambda e: start_standalone_timer("regular")),
+                                   ft.IconButton(ft.Icons.ACCESS_TIME,
+                                                  tooltip=f"Pomodoro ({tm.settings.pomodoro_work} мин)",
+                                                  icon_color=ft.Colors.RED,
+                                                  on_click=lambda e: start_standalone_timer("pomodoro")),
+                                   ft.Container(width=1, height=24, bgcolor=ft.Colors.GREY_400,
+                                                 margin=ft.margin.symmetric(horizontal=4)),
+                                   ft.IconButton(ft.Icons.CALENDAR_MONTH, tooltip="Календарь",
+                                                  on_click=lambda e: show_calendar()),
+                                   ft.IconButton(ft.Icons.SHOW_CHART, tooltip="Статистика",
+                                                  on_click=lambda e: show_dashboard()),
+                                   ft.IconButton(ft.Icons.NOTE_ALT, tooltip="Шаблоны",
+                                                  on_click=lambda e: show_templates()),
+                                   ft.IconButton(ft.Icons.SETTINGS, tooltip="Настройки",
+                                                  on_click=show_settings),
+                                   ft.ElevatedButton("Добавить задачу", icon=ft.Icons.ADD,
+                                                      on_click=lambda e: open_editor())],
+                                 spacing=4, wrap=True,
+                                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                 vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                          standalone_timers_view, timer_banner, tasks_view,
                       ], spacing=10, expand=True)),
     ], expand=True, spacing=10))
 
